@@ -1,4 +1,4 @@
-﻿unit CmdHereWizard;
+unit CmdHereWizard;
 
 interface
 
@@ -6,11 +6,14 @@ uses
    System.SysUtils,
    System.Classes,
    System.Types,
+   System.IOUtils,
    Winapi.Windows,
    Winapi.ShellAPI,
    ToolsAPI;
 
 type
+   TShellKind = (skCmd, skWindowsTerminal);
+
    TCmdHerePMCreator = class(TNotifierObject, IOTAProjectMenuItemCreatorNotifier)
    public
       procedure AddMenu(const Project: IOTAProject;
@@ -30,8 +33,9 @@ type
       FPosition: Integer;
       FVerb: string;
       FIsMulti: Boolean;
+      FShell: TShellKind;
    public
-      constructor Create;
+      constructor Create(AShell: TShellKind); reintroduce;
 
       { IOTALocalMenu }
       function GetCaption: string;
@@ -64,23 +68,48 @@ procedure Register;
 implementation
 
 const
-   sFileContainer        = 'FileContainer';
-   sProjectContainer     = 'ProjectContainer';
-   sProjectGroupContainer= 'ProjectGroupContainer';
-   sDirectoryContainer   = 'DirectoryContainer';
+   sFileContainer         = 'FileContainer';
+   sProjectContainer      = 'ProjectContainer';
+   sProjectGroupContainer = 'ProjectGroupContainer';
+   sDirectoryContainer    = 'DirectoryContainer';
+
+var
+   GNotifierIndex: Integer = -1;
+   GHasWindowsTerminal: Boolean = False;
 
 function Quote(const S: string): string;
 begin
    Result := '"' + S + '"';
 end;
 
-procedure OpenCmdHere(const Folder: string);
+function ShellAvailable(const ExeName: string): Boolean;
 var
-   Params: string;
+   Buf: array[0..MAX_PATH - 1] of Char;
+   FilePart: PChar;
 begin
-   if Folder = '' then Exit;
-   Params := '/K cd /d ' + Quote(Folder);
-   ShellExecute(0, 'open', 'cmd.exe', PChar(Params), nil, SW_SHOWNORMAL);
+   Result := SearchPath(nil, PChar(ExeName), nil, MAX_PATH, Buf, FilePart) > 0;
+end;
+
+procedure LaunchShell(AShell: TShellKind; const Folder: string);
+var
+   Exe, Params: string;
+begin
+   if (Folder = '') or not TDirectory.Exists(Folder) then Exit;
+
+   case AShell of
+      skCmd:
+         begin
+            Exe := 'cmd.exe';
+            Params := '';
+         end;
+      skWindowsTerminal:
+         begin
+            Exe := 'wt.exe';
+            Params := '-d ' + Quote(Folder);
+         end;
+   end;
+
+   ShellExecute(0, 'open', PChar(Exe), PChar(Params), PChar(Folder), SW_SHOWNORMAL);
 end;
 
 function FolderOf(const FileName: string): string;
@@ -90,20 +119,33 @@ end;
 
 function LooksLikePath(const S: string): Boolean;
 begin
-   Result := (Length(S) > 1) and (S[2] = ':') and DirectoryExists(S) or FileExists(S);
+   if S = '' then
+      Exit(False);
+   Result := (TPath.IsPathRooted(S) and TDirectory.Exists(S)) or TFile.Exists(S);
 end;
 
-function FirstContext(const List: IInterfaceList): IOTAProjectMenuContext;
+function ProjectFolder(const Project: IOTAProject): string;
+var
+   Cur: IOTAProjectCurrentFolder;
 begin
-   Result := nil;
-   if (List <> nil) and (List.Count > 0) then
-      Supports(List.Items[0], IOTAProjectMenuContext, Result);
+   Result := '';
+   if Project = nil then Exit;
+
+   if Supports(Project, IOTAProjectCurrentFolder, Cur) then
+   begin
+      Result := Cur.CurrentFolderPath;
+      if (Result <> '') and TDirectory.Exists(Result) then
+         Exit(IncludeTrailingPathDelimiter(Result));
+      Result := '';
+   end;
+
+   if TFile.Exists(Project.FileName) then
+      Result := FolderOf(Project.FileName);
 end;
 
 function ResolveClickedFolder(const MenuCtx: IOTAProjectMenuContext): string;
 var
    ident, verb: string;
-   prj: IOTAProject;
 begin
    Result := '';
    if MenuCtx = nil then Exit;
@@ -113,31 +155,28 @@ begin
 
    if SameText(ident, sDirectoryContainer) then
    begin
-      if LooksLikePath(verb) then
+      if LooksLikePath(verb) and TDirectory.Exists(verb) then
          Exit(IncludeTrailingPathDelimiter(verb));
    end;
 
    if SameText(ident, sFileContainer) then
    begin
-      if FileExists(verb) then
+      if TFile.Exists(verb) then
          Exit(FolderOf(verb));
    end;
 
    if SameText(ident, sProjectContainer) or SameText(ident, sProjectGroupContainer) then
    begin
-      prj := MenuCtx.Project;
-      if (prj <> nil) and FileExists(prj.FileName) then
-         Exit(FolderOf(prj.FileName));
+      Result := ProjectFolder(MenuCtx.Project);
+      if Result <> '' then Exit;
    end;
 
-   if DirectoryExists(verb) then
+   if TDirectory.Exists(verb) then
       Exit(IncludeTrailingPathDelimiter(verb));
-   if FileExists(verb) then
+   if TFile.Exists(verb) then
       Exit(FolderOf(verb));
 
-   prj := MenuCtx.Project;
-   if (prj <> nil) and FileExists(prj.FileName) then
-      Exit(FolderOf(prj.FileName));
+   Result := ProjectFolder(MenuCtx.Project);
 end;
 
 {=== TCmdHerePMCreator =======================================================}
@@ -146,27 +185,39 @@ procedure TCmdHerePMCreator.AddMenu(const Project: IOTAProject;
                                     const IdentList: TStrings;
                                     const ProjectManagerMenuList: IInterfaceList;
                                     IsMultiSelect: Boolean);
-var
-   Item: IOTAProjectManagerMenu;
 begin
-   Item := TCmdHereLocalMenu.Create;
-   ProjectManagerMenuList.Add(Item);
+   ProjectManagerMenuList.Add(IOTAProjectManagerMenu(TCmdHereLocalMenu.Create(skCmd)));
+   if GHasWindowsTerminal then
+      ProjectManagerMenuList.Add(IOTAProjectManagerMenu(TCmdHereLocalMenu.Create(skWindowsTerminal)));
 end;
 
 {=== TCmdHereLocalMenu =======================================================}
 
-constructor TCmdHereLocalMenu.Create;
+constructor TCmdHereLocalMenu.Create(AShell: TShellKind);
 begin
    inherited Create;
-   FCaption   := 'Open CMD here';
-   FChecked   := False;
-   FEnabled   := True;
-   FHelpCtx   := 0;
-   FName      := 'OpenCMDHere';
-   FParent    := '';       { empty = no submenu }
-   FPosition  := 0;        { 0 = IDE decides, change if you want custom positioning }
-   FVerb      := '';       { not needed }
-   FIsMulti   := True;     { open CMD for each selected node }
+   FShell    := AShell;
+   FChecked  := False;
+   FEnabled  := True;
+   FHelpCtx  := 0;
+   FIsMulti  := True;
+   FVerb     := '';
+   FParent   := '';
+
+   case AShell of
+      skCmd:
+         begin
+            FCaption  := 'Open CMD here';
+            FName     := 'OpenCmdHereItem';
+            FPosition := 1;
+         end;
+      skWindowsTerminal:
+         begin
+            FCaption  := 'Open Windows Terminal here';
+            FName     := 'OpenWindowsTerminalHereItem';
+            FPosition := 2;
+         end;
+   end;
 end;
 
 function TCmdHereLocalMenu.GetCaption: string;
@@ -201,7 +252,7 @@ end;
 
 function TCmdHereLocalMenu.GetHelpContext: Integer;
 begin
-   Result := FHelpCtx; { 0 = no help }
+   Result := FHelpCtx;
 end;
 
 procedure TCmdHereLocalMenu.SetHelpContext(Value: Integer);
@@ -278,7 +329,7 @@ begin
       begin
          Folder := ResolveClickedFolder(Ctx);
          if Folder <> '' then
-            OpenCmdHere(Folder);
+            LaunchShell(FShell, Folder);
       end;
    end;
 end;
@@ -294,9 +345,25 @@ procedure Register;
 var
    PM: IOTAProjectManager;
 begin
+   GHasWindowsTerminal := ShellAvailable('wt.exe');
+
    if Supports(BorlandIDEServices, IOTAProjectManager, PM) then
-      PM.AddMenuItemCreatorNotifier(TCmdHerePMCreator.Create);
+      GNotifierIndex := PM.AddMenuItemCreatorNotifier(TCmdHerePMCreator.Create);
 end;
 
-end.
+procedure UnregisterNotifier;
+var
+   PM: IOTAProjectManager;
+begin
+   if GNotifierIndex < 0 then Exit;
+   if Supports(BorlandIDEServices, IOTAProjectManager, PM) then
+      PM.RemoveMenuItemCreatorNotifier(GNotifierIndex);
+   GNotifierIndex := -1;
+end;
 
+initialization
+
+finalization
+   UnregisterNotifier;
+
+end.
